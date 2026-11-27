@@ -118,6 +118,7 @@ async def test_network_counts_use_child_discovery_without_registry_links(hass, m
     coord._stacks.add(STACK_Z2M)
     await coord._start_bridge_readers()
     assert coord.bridge_reader(STACK_Z2M) is not None
+    assert STACK_Z2M not in {part["key"] for part in coord.dashboard_status()["parts"]}
     bases.update(known_bases)
     await coord._start_bridge_readers()
     assert coord.bridge_reader(STACK_Z2M) is None
@@ -141,6 +142,15 @@ async def test_network_counts_use_child_discovery_without_registry_links(hass, m
 
     rows = {row["key"]: row for row in coord.dashboard_networks()}
     assert STACK_Z2M not in rows
+    parts = {
+        part["key"]: (part["name"], part["state"])
+        for part in coord.dashboard_status()["parts"]
+        if stack_z2m.is_instance(part["key"])
+    }
+    assert parts == {
+        scope: (f"Bridge: {reader.base_topic}", BRIDGE_RUNNING)
+        for scope, reader in zip(scopes, readers, strict=True)
+    }
     for child, scope in zip(children, scopes, strict=True):
         assert coord.device_networks(child.id) == [scope]
         assert rows[scope]["watched"] == 1
@@ -467,6 +477,9 @@ async def test_a_bridge_not_known_yet_is_read_on_the_default_topic(hass, monkeyp
     first = coord.bridge_reader(STACK_Z2M)
     assert coord.bridge_stacks == [STACK_Z2M]
     assert first.base_topic == "zigbee2mqtt"
+    assert STACK_Z2M not in {part["key"] for part in coord.dashboard_status()["parts"]}
+    first._on_state(_message({"state": "online"}))
+    assert STACK_Z2M in {part["key"] for part in coord.dashboard_status()["parts"]}
     payloads[bridge.id] = "zigbee2mqtt"
     await coord._start_bridge_readers()
     assert coord.bridge_reader(STACK_Z2M) is first, "the same reader, not a second one"
