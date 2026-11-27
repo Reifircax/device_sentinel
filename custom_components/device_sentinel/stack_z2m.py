@@ -45,7 +45,6 @@ from math import isfinite
 from typing import Any
 
 from homeassistant.components import mqtt
-from homeassistant.components.mqtt import debug_info
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
@@ -93,7 +92,7 @@ def owns_domain(domain: str) -> bool:
     `mqtt` domain, shared with every other MQTT thing in the house.
     Presence is told by the bridge device rather than by this test
     (rule STACK-01). This only selects the stack's resolver; actual
-    ownership requires a registry parent, discovery topic or device roll
+    ownership requires a registry parent or an unambiguous device roll
     (rule STACK-03), so unrelated MQTT devices are not claimed.
     """
     return domain == "mqtt"
@@ -291,19 +290,14 @@ def make_readers(
         for entry in hass.config_entries.async_entries("mqtt")
         for device in dr.async_entries_for_config_entry(registry, entry.entry_id)
     }
-    found: list[tuple[Any, str | None, bool]] = []
+    found: list[tuple[Any, str | None]] = []
     for device in devices.values():
         if not is_bridge_device(device) or device.disabled_by is not None:
             continue
         address = coordinator_address(device)
-        base = finder.base_for(address) if finder is not None and address else None
-        found.append((device, base or _discovery_base(hass, device.id, bridge=True), base is not None))
-    # A confirmed coordinator wins over stale MQTT entity discovery. If
-    # several registry entries only advertise the same topic, claim none.
-    claims: dict[str, list[bool]] = {}
-    for _device, base, confirmed in found:
-        if base is not None:
-            claims.setdefault(base, []).append(confirmed)
+        if address is None:
+            continue
+        found.append((device, finder.base_for(address) if finder is not None else None))
     # The bridge on the default topic keeps the scope, Bridge sensor and
     # saved outages older releases gave it, so a house with one bridge on
     # zigbee2mqtt sees no change; any other bridge is named by its own
@@ -312,10 +306,7 @@ def make_readers(
     # A bridge whose topic is not known yet is pending: it holds on to a
     # reader it already has, and gets none, and no sensor, until its topic
     # is known, since that decides its scope.
-    for device, base, confirmed in found:
-        if base is not None and len(claims[base]) > 1:
-            if not confirmed or claims[base].count(True) != 1:
-                base = None
+    for device, base in found:
         key = STACK if base == Z2M_BASE_TOPIC_DEFAULT else f"{STACK}:{device.id}"
         reader = Z2MBridgeReader(hass, base)
         reader.pending = base is None
@@ -326,79 +317,28 @@ def make_readers(
     return readers
 
 
-def _discovery_base(hass: HomeAssistant, device_id: str, *, bridge: bool = False) -> str | None:
-    """Home Assistant may know the exact topic before our finder hears it."""
-    try:
-        return _base_from_info(debug_info.info_for_device(hass, device_id), bridge=bridge)
-    except Exception as err:  # noqa: BLE001 - MQTT may still be loading
-        LOGGER.debug("MQTT discovery for device %s is not ready: %s", device_id, err)
-        return None
-
-
-def _base_from_info(info: dict[str, Any], *, bridge: bool = False) -> str | None:
-    """Find an exact bridge topic advertised by an MQTT device."""
-    leaves = (Z2M_TOPIC_STATE, Z2M_TOPIC_INFO, Z2M_TOPIC_DEVICES) if bridge else (Z2M_TOPIC_STATE,)
-    suffixes = tuple(f"/{leaf}" for leaf in leaves)
-    bases: set[str] = set()
-    for entity in info.get("entities", []):
-        topics = [item.get("topic") for item in entity.get("subscriptions", [])]
-        discovery = entity.get("discovery_data") or {}
-        payload = discovery.get("payload")
-        if isinstance(payload, dict):
-            topics.extend(payload.get(field) for field in ("availability_topic", "avty_t"))
-            if bridge:
-                topics.extend(payload.get(field) for field in ("state_topic", "stat_t"))
-            availability = payload.get("availability", payload.get("avty"))
-            if isinstance(availability, list):
-                topics.extend(item.get("topic", item.get("t")) for item in availability if isinstance(item, dict))
-        for topic in topics:
-            if not isinstance(topic, str):
-                continue
-            if topic.startswith("~") and isinstance(payload, dict) and isinstance(payload.get("~"), str):
-                topic = payload["~"] + topic[1:]
-            for suffix in suffixes:
-                if topic.endswith(suffix):
-                    base = topic[:-len(suffix)]
-                    if base and not any(char in base for char in ("+", "#", "\x00")):
-                        bases.add(base)
-    return next(iter(bases)) if len(bases) == 1 else None
-
-
 def reader_for_device(
     readers: dict[str, Any], hass: HomeAssistant, device_id: str
 ) -> Any | None:
-    """Use the registry parent, MQTT discovery, or an unambiguous IEEE."""
-    registry = dr.async_get(hass)
-    device = registry.async_get(device_id)
+    """Use the registry parent first, then an unambiguous IEEE (rule STACK-03)."""
+    device = dr.async_get(hass).async_get(device_id)
     if device is None:
         return None
     key = device_key(device)
     candidates = [reader for scope, reader in readers.items() if is_instance(scope)]
-    instances = [reader for reader in candidates if getattr(reader, "bridge_device_id", None) is not None]
     parent = device_field(device, "via_device_id")
     if parent is not None:
-        for reader in instances:
-            if reader.bridge_device_id == parent:
-                return reader
-        # Do not use another bridge's data if the actual parent was
-        # identified as Z2M but is not being read (e.g. it is disabled).
-        parent_device = registry.async_get(parent)
-        if parent_device is not None and is_bridge_device(parent_device):
-            return None
+        matches = [reader for reader in candidates if getattr(reader, "bridge_device_id", None) == parent]
+        # A known parent must never fall through to another bridge's old roll.
+        if matches or any(getattr(reader, "bridge_device_id", None) for reader in candidates):
+            return matches[0] if len(matches) == 1 else None
     if key:
-        if instances:
-            base = _discovery_base(hass, device_id)
-            if base is not None:
-                # An explicit bridge topic takes precedence over a retained
-                # device list from an old instance. Unknown topics stay unknown.
-                matches = [reader for reader in instances if reader.base_topic == base]
-                return matches[0] if len(matches) == 1 else None
-        matches = [reader for reader in instances or candidates if callable(getattr(reader, "has_device", None)) and reader.has_device(key)]
+        matches = [reader for reader in candidates if callable(getattr(reader, "has_device", None)) and reader.has_device(key)]
         if matches:
             return matches[0] if len(matches) == 1 else None
     # Legacy readers are used only by callers with no discovered bridge.
     legacy = readers.get(STACK)
-    return legacy if not instances else None
+    return legacy if legacy is not None and getattr(legacy, "bridge_device_id", None) is None else None
 
 
 def is_bridge_device(device: dr.DeviceEntry) -> bool:

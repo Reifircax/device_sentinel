@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from homeassistant.components.mqtt import debug_info
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers import device_registry as dr
 from homeassistant.util import dt as dt_util
@@ -105,55 +104,6 @@ async def test_parent_wins_over_stale_roll_and_ambiguous_ieee_is_unknown(hass, m
     # address stays claimed twice and still gives no opinion.
     second._on_devices(_message([]))
     assert stack_z2m.reader_for_device(readers, hass, children[0].id) is None
-
-
-async def test_network_counts_use_child_discovery_without_registry_links(hass, monkeypatch):
-    _source, bridges, children, bases = _fleet(hass, monkeypatch)
-    payloads = {}
-    monkeypatch.setattr(debug_info, "info_for_device", lambda _hass, device_id: payloads.get(device_id, {}))
-    monkeypatch.setattr(stack_z2m.Z2MBridgeReader, "async_start", AsyncMock(return_value=False))
-    known_bases = bases.copy()
-    bases.clear()
-    coord = await setup_coordinator(hass)
-    coord._stacks.add(STACK_Z2M)
-    await coord._start_bridge_readers()
-    assert coord.bridge_reader(STACK_Z2M) is not None
-    assert STACK_Z2M not in {part["key"] for part in coord.dashboard_status()["parts"]}
-    bases.update(known_bases)
-    await coord._start_bridge_readers()
-    assert coord.bridge_reader(STACK_Z2M) is None
-    registry = dr.async_get(hass)
-    scopes = [f"z2m:{bridge.id}" for bridge in bridges]
-    readers = [coord.bridge_reader(scope) for scope in scopes]
-    for index, (child, reader) in enumerate(zip(children, readers, strict=True)):
-        registry.async_update_device(child.id, via_device_id=None)
-        coord._watched[child.id] = "mqtt"
-        coord._radio_stack[child.id] = STACK_Z2M
-        coord._stack_keys[child.id] = (STACK_Z2M, stack_z2m.device_key(child))
-        payloads[child.id] = {"entities": [{"subscriptions": [
-            {"topic": f"{reader.base_topic}/Sensor {index}"},
-            {"topic": f"{reader.base_topic}/bridge/state"},
-        ]}]}
-        reader._on_state(_message({"state": "online"}))
-        # A retained device roll on the *other* bridge must not win.
-        readers[1 - index]._on_devices(_message([
-            {"friendly_name": f"Sensor {index}", "ieee_address": stack_z2m.device_key(child)},
-        ]))
-
-    rows = {row["key"]: row for row in coord.dashboard_networks()}
-    assert STACK_Z2M not in rows
-    parts = {
-        part["key"]: (part["name"], part["state"])
-        for part in coord.dashboard_status()["parts"]
-        if stack_z2m.is_instance(part["key"])
-    }
-    assert parts == {
-        scope: (f"Bridge: {reader.base_topic}", BRIDGE_RUNNING)
-        for scope, reader in zip(scopes, readers, strict=True)
-    }
-    for child, scope in zip(children, scopes, strict=True):
-        assert coord.device_networks(child.id) == [scope]
-        assert rows[scope]["watched"] == 1
 
 
 @pytest.mark.parametrize("factor", [1, 1000])
