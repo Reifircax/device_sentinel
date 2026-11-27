@@ -291,14 +291,19 @@ def make_readers(
         for entry in hass.config_entries.async_entries("mqtt")
         for device in dr.async_entries_for_config_entry(registry, entry.entry_id)
     }
-    found: list[tuple[Any, str | None]] = []
+    found: list[tuple[Any, str | None, bool]] = []
     for device in devices.values():
         if not is_bridge_device(device) or device.disabled_by is not None:
             continue
         address = coordinator_address(device)
-        if address is None:
-            continue
-        found.append((device, finder.base_for(address) if finder is not None else None))
+        base = finder.base_for(address) if finder is not None and address else None
+        found.append((device, base or _discovery_base(hass, device.id, bridge=True), base is not None))
+    # A confirmed coordinator wins over stale MQTT entity discovery. If
+    # several registry entries only advertise the same topic, claim none.
+    claims: dict[str, list[bool]] = {}
+    for _device, base, confirmed in found:
+        if base is not None:
+            claims.setdefault(base, []).append(confirmed)
     # The bridge on the default topic keeps the scope, Bridge sensor and
     # saved outages older releases gave it, so a house with one bridge on
     # zigbee2mqtt sees no change; any other bridge is named by its own
@@ -307,7 +312,10 @@ def make_readers(
     # A bridge whose topic is not known yet is pending: it holds on to a
     # reader it already has, and gets none, and no sensor, until its topic
     # is known, since that decides its scope.
-    for device, base in found:
+    for device, base, confirmed in found:
+        if base is not None and len(claims[base]) > 1:
+            if not confirmed or claims[base].count(True) != 1:
+                base = None
         key = STACK if base == Z2M_BASE_TOPIC_DEFAULT else f"{STACK}:{device.id}"
         reader = Z2MBridgeReader(hass, base)
         reader.pending = base is None
@@ -318,9 +326,19 @@ def make_readers(
     return readers
 
 
-def _base_from_info(info: dict[str, Any]) -> str | None:
+def _discovery_base(hass: HomeAssistant, device_id: str, *, bridge: bool = False) -> str | None:
+    """Home Assistant may know the exact topic before our finder hears it."""
+    try:
+        return _base_from_info(debug_info.info_for_device(hass, device_id), bridge=bridge)
+    except Exception as err:  # noqa: BLE001 - MQTT may still be loading
+        LOGGER.debug("MQTT discovery for device %s is not ready: %s", device_id, err)
+        return None
+
+
+def _base_from_info(info: dict[str, Any], *, bridge: bool = False) -> str | None:
     """Find an exact bridge topic advertised by an MQTT device."""
-    suffix = f"/{Z2M_TOPIC_STATE}"
+    leaves = (Z2M_TOPIC_STATE, Z2M_TOPIC_INFO, Z2M_TOPIC_DEVICES) if bridge else (Z2M_TOPIC_STATE,)
+    suffixes = tuple(f"/{leaf}" for leaf in leaves)
     bases: set[str] = set()
     for entity in info.get("entities", []):
         topics = [item.get("topic") for item in entity.get("subscriptions", [])]
@@ -328,6 +346,8 @@ def _base_from_info(info: dict[str, Any]) -> str | None:
         payload = discovery.get("payload")
         if isinstance(payload, dict):
             topics.extend(payload.get(field) for field in ("availability_topic", "avty_t"))
+            if bridge:
+                topics.extend(payload.get(field) for field in ("state_topic", "stat_t"))
             availability = payload.get("availability", payload.get("avty"))
             if isinstance(availability, list):
                 topics.extend(item.get("topic", item.get("t")) for item in availability if isinstance(item, dict))
@@ -336,10 +356,11 @@ def _base_from_info(info: dict[str, Any]) -> str | None:
                 continue
             if topic.startswith("~") and isinstance(payload, dict) and isinstance(payload.get("~"), str):
                 topic = payload["~"] + topic[1:]
-            if topic.endswith(suffix):
-                base = topic[:-len(suffix)]
-                if base and not any(char in base for char in ("+", "#", "\x00")):
-                    bases.add(base)
+            for suffix in suffixes:
+                if topic.endswith(suffix):
+                    base = topic[:-len(suffix)]
+                    if base and not any(char in base for char in ("+", "#", "\x00")):
+                        bases.add(base)
     return next(iter(bases)) if len(bases) == 1 else None
 
 
@@ -366,11 +387,7 @@ def reader_for_device(
             return None
     if key:
         if instances:
-            try:
-                base = _base_from_info(debug_info.info_for_device(hass, device_id))
-            except Exception as err:  # noqa: BLE001 - MQTT may still be loading
-                LOGGER.debug("MQTT discovery for device %s is not ready: %s", device_id, err)
-                base = None
+            base = _discovery_base(hass, device_id)
             if base is not None:
                 # An explicit bridge topic takes precedence over a retained
                 # device list from an old instance. Unknown topics stay unknown.
