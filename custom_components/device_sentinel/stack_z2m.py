@@ -41,9 +41,11 @@ than one made without it (rule FRZ-15).
 from __future__ import annotations
 
 import json
+from math import isfinite
 from typing import Any
 
 from homeassistant.components import mqtt
+from homeassistant.components.mqtt import debug_info
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
@@ -91,7 +93,7 @@ def owns_domain(domain: str) -> bool:
     `mqtt` domain, shared with every other MQTT thing in the house.
     Presence is told by the bridge device rather than by this test
     (rule STACK-01). This only selects the stack's resolver; actual
-    ownership requires a registry parent or an unambiguous device roll
+    ownership requires a registry parent, discovery topic or device roll
     (rule STACK-03), so unrelated MQTT devices are not claimed.
     """
     return domain == "mqtt"
@@ -316,28 +318,70 @@ def make_readers(
     return readers
 
 
+def _base_from_info(info: dict[str, Any]) -> str | None:
+    """Find an exact bridge topic advertised by an MQTT device."""
+    suffix = f"/{Z2M_TOPIC_STATE}"
+    bases: set[str] = set()
+    for entity in info.get("entities", []):
+        topics = [item.get("topic") for item in entity.get("subscriptions", [])]
+        discovery = entity.get("discovery_data") or {}
+        payload = discovery.get("payload")
+        if isinstance(payload, dict):
+            topics.extend(payload.get(field) for field in ("availability_topic", "avty_t"))
+            availability = payload.get("availability", payload.get("avty"))
+            if isinstance(availability, list):
+                topics.extend(item.get("topic", item.get("t")) for item in availability if isinstance(item, dict))
+        for topic in topics:
+            if not isinstance(topic, str):
+                continue
+            if topic.startswith("~") and isinstance(payload, dict) and isinstance(payload.get("~"), str):
+                topic = payload["~"] + topic[1:]
+            if topic.endswith(suffix):
+                base = topic[:-len(suffix)]
+                if base and not any(char in base for char in ("+", "#", "\x00")):
+                    bases.add(base)
+    return next(iter(bases)) if len(bases) == 1 else None
+
+
 def reader_for_device(
     readers: dict[str, Any], hass: HomeAssistant, device_id: str
 ) -> Any | None:
-    """Use the registry parent first, then an unambiguous IEEE (rule STACK-03)."""
-    device = dr.async_get(hass).async_get(device_id)
+    """Use the registry parent, MQTT discovery, or an unambiguous IEEE."""
+    registry = dr.async_get(hass)
+    device = registry.async_get(device_id)
     if device is None:
         return None
     key = device_key(device)
     candidates = [reader for scope, reader in readers.items() if is_instance(scope)]
+    instances = [reader for reader in candidates if getattr(reader, "bridge_device_id", None) is not None]
     parent = device_field(device, "via_device_id")
     if parent is not None:
-        matches = [reader for reader in candidates if getattr(reader, "bridge_device_id", None) == parent]
-        # A known parent must never fall through to another bridge's old roll.
-        if matches or any(getattr(reader, "bridge_device_id", None) for reader in candidates):
-            return matches[0] if len(matches) == 1 else None
+        for reader in instances:
+            if reader.bridge_device_id == parent:
+                return reader
+        # Do not use another bridge's data if the actual parent was
+        # identified as Z2M but is not being read (e.g. it is disabled).
+        parent_device = registry.async_get(parent)
+        if parent_device is not None and is_bridge_device(parent_device):
+            return None
     if key:
-        matches = [reader for reader in candidates if callable(getattr(reader, "has_device", None)) and reader.has_device(key)]
+        if instances:
+            try:
+                base = _base_from_info(debug_info.info_for_device(hass, device_id))
+            except Exception as err:  # noqa: BLE001 - MQTT may still be loading
+                LOGGER.debug("MQTT discovery for device %s is not ready: %s", device_id, err)
+                base = None
+            if base is not None:
+                # An explicit bridge topic takes precedence over a retained
+                # device list from an old instance. Unknown topics stay unknown.
+                matches = [reader for reader in instances if reader.base_topic == base]
+                return matches[0] if len(matches) == 1 else None
+        matches = [reader for reader in instances or candidates if callable(getattr(reader, "has_device", None)) and reader.has_device(key)]
         if matches:
             return matches[0] if len(matches) == 1 else None
     # Legacy readers are used only by callers with no discovered bridge.
     legacy = readers.get(STACK)
-    return legacy if legacy is not None and getattr(legacy, "bridge_device_id", None) is None else None
+    return legacy if not instances else None
 
 
 def is_bridge_device(device: dr.DeviceEntry) -> bool:
@@ -391,6 +435,7 @@ class Z2MBridgeReader:
         self.came_online_at: float | None = None
         self._permit_join: bool = False
         self._permit_join_end: str | None = None
+        self._permit_join_deadline: float | None = None
         self._last_heard: str | None = None
         # When a pairing window last closed, as a UTC timestamp. A
         # device paired near the end of a window may not report until
@@ -606,6 +651,7 @@ class Z2MBridgeReader:
             return BRIDGE_UNKNOWN
         if self._online is not True:
             return BRIDGE_DOWN
+        self._expire_pairing(dt_util.utcnow().timestamp())
         if self._permit_join:
             return BRIDGE_BINDING
         return BRIDGE_RUNNING
@@ -647,6 +693,7 @@ class Z2MBridgeReader:
     @property
     def pairing_changed_at(self) -> float | None:
         """When the bridge last said pairing opened or closed, or None."""
+        self._expire_pairing(dt_util.utcnow().timestamp())
         return self._pairing_changed_at
 
     def joins_seen(self) -> bool:
@@ -783,6 +830,15 @@ class Z2MBridgeReader:
         self._online = online
 
     @callback
+    def _expire_pairing(self, now: float) -> None:
+        """Close a heard window at its deadline even if MQTT misses the close."""
+        end = self._permit_join_deadline
+        if self._permit_join and end is not None and end <= now:
+            self._permit_join = False
+            self._pairing_closed_at = end
+            self._pairing_changed_at = end
+
+    @callback
     def _on_info(self, msg: mqtt.ReceiveMessage) -> None:
         """Handle bridge/info: read permit_join and permit_join_end.
 
@@ -790,19 +846,24 @@ class Z2MBridgeReader:
         permit_join_timeout. A payload that will not parse leaves the
         prior pairing state untouched rather than dropping it.
         """
-        self._last_heard = dt_util.utcnow().isoformat()
+        received = dt_util.utcnow()
+        self._last_heard = received.isoformat()
         data = _load(_decode(msg.payload))
         if not isinstance(data, dict):
             return
+        now = received.timestamp()
+        self._expire_pairing(now)
         was_open = self._permit_join
-        self._permit_join = bool(data.get("permit_join", False))
+        end = data.get("permit_join_end")
+        deadline = _pairing_deadline(end)
+        self._permit_join = data.get("permit_join") is True and (deadline is None or deadline > now)
         # Note the moment a window closes, so a device that reports
         # just after it can still be credited to the pairing rather
         # than to itself (rule FRZ-16).
         if was_open and not self._permit_join:
-            self._pairing_closed_at = dt_util.utcnow().timestamp()
+            self._pairing_closed_at = now
         if was_open != self._permit_join:
-            self._pairing_changed_at = dt_util.utcnow().timestamp()
+            self._pairing_changed_at = now
         # A window opening heard live, after bridge/event was
         # subscribed, is one whose joins are all heard. The retained
         # info read at subscribe, already open, is not; nor is the one
@@ -819,8 +880,8 @@ class Z2MBridgeReader:
             # joins sent while it was cut off were never heard.
             self._window_heard = False
         self._info_heard = True
-        end = data.get("permit_join_end")
         self._permit_join_end = str(end) if end is not None else None
+        self._permit_join_deadline = deadline
         self._read_hardware(data)
         # The availability settings, read rather than assumed. Absent
         # or malformed leaves the previous reading alone, so one bad
@@ -976,6 +1037,19 @@ class Z2MBridgeReader:
         if not isinstance(state, str) or state not in ("online", "offline"):
             return
         self._availability[name] = (state, dt_util.utcnow().isoformat())
+
+
+def _pairing_deadline(value: Any) -> float | None:
+    """Read Zigbee2MQTT's epoch deadline, in seconds or milliseconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        stamp = float(value)
+    except (ValueError, OverflowError):
+        return None
+    if not isfinite(stamp):
+        return None
+    return stamp / 1000 if stamp >= 1_000_000_000_000 else stamp
 
 
 def _decode(payload: Any) -> str:

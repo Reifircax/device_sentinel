@@ -369,7 +369,10 @@ class InterventionMixin:
         }
         for scope, previous in list(self._bridge_readers.items()):
             held = getattr(previous, "bridge_device_id", None)
-            if held is not None and scope not in discovered and held not in pending:
+            if scope not in discovered and (
+                (held is not None and held not in pending)
+                or (held is None and not pending and any(key.startswith(f"{scope}:") for key in discovered))
+            ):
                 previous.async_stop()
                 self._bridge_readers.pop(scope)
                 self._bridge_down_pending.pop(scope, None)
@@ -560,7 +563,11 @@ class InterventionMixin:
         """Read only the bridge that owns this device (rule STACK-03)."""
         owner = self._stack_keys.get(device_id)
         legacy = self._bridge_readers.get(owner[0]) if owner else None
-        if legacy is not None and getattr(legacy, "bridge_device_id", None) is None:
+        if (
+            legacy is not None
+            and getattr(legacy, "bridge_device_id", None) is None
+            and not any(scope.startswith(f"{owner[0]}:") for scope in self._bridge_readers)
+        ):
             return legacy
         domain = domain or self._watched.get(device_id)
         if domain is None:
@@ -569,7 +576,9 @@ class InterventionMixin:
         # One bridge answers for every device on its domain, as it always
         # has; only a house with several asks which one owns the device.
         if not self.several_bridges(domain):
-            return reader_for_domain(self._bridge_readers, domain)
+            reader = reader_for_domain(self._bridge_readers, domain)
+            if reader is not None:
+                return reader
         return reader_for_device(
             self._bridge_readers, self.hass, domain, device_id,
         )
